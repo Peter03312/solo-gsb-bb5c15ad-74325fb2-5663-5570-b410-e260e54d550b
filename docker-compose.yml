@@ -13,6 +13,10 @@ services:
       # below, so queued and finished jobs survive `docker compose up
       # --build` and container restarts.
       RESOLVER_DB: /app/data/jobs.db
+      # Server-wide cap on rendered conflict-tree nodes in 409 responses
+      # (composite + leaf). Positive N = at most N nodes; 0 = unlimited;
+      # unset/invalid = built-in default (10000) and a startup warning.
+      RESOLVER_CONFLICT_NODE_BUDGET: "10000"
     volumes:
       - resolver-data:/app/data
     # The service only needs the loopback/network you expose; it never calls

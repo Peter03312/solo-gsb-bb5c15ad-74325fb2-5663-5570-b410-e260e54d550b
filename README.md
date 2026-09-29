@@ -1267,6 +1267,66 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
 
 错误请求（非 PEP 440 版本、非法说明符、多余字段等）返回 `400/422` 并附带原因。
 
+### 冲突树节点预算（服务端可配置）
+
+冲突报告的遍历**受服务端节点预算约束**：大量回溯分支时，失败树不会被无限
+展开。预算通过环境变量 `RESOLVER_CONFLICT_NODE_BUDGET` 在服务端配置，
+`/resolve`、`POST /jobs` 以及所有内嵌冲突摘要的接口（漏洞规避、环境矩阵、
+版本撤回、升级可行性）共用同一预算：
+
+| 配置值 | 含义 |
+| --- | --- |
+| 未设置 / 空 | 默认预算 `10000` 个节点（composite + leaf 合计） |
+| 正整数 `N` | 最多渲染 `N` 个失败树节点 |
+| `0` | 不限制（恢复完整展开） |
+| 非法值 | 启动时告警并回退到默认预算，服务照常可用 |
+
+遍历仍是原来的**前序深度优先、按求解器自身分支顺序**展开，因此：
+
+- **预算充足**：`conflict.tree`、`terminal_conflicts` 的字段、分支顺序与每条
+  约束路径与历史输出完全一致，响应中不出现任何截断字段。
+- **预算耗尽**：仍返回原来的 `409`，`conflict.tree` 在原处截断，
+  `terminal_conflicts` 只列出**已保留节点**对应的终端冲突，其余分支不再展开。
+  被截断的 composite 节点就地标记，冲突摘要顶层给出统计；解析选择、
+  `attempts`（候选求值次数）与 `locks`（锁处置）完全不受影响。
+
+截断时在被截断的 composite 节点上新增 `"truncated": true` 与
+`"omitted_branches"`（该节点直接省略的子分支数），顶层 `conflict` 增加：
+
+```json
+{
+  "tree": {
+    "kind": "composite", "package": "app",
+    "failed_branches": [ "…仅保留前序遍历中装得下的分支…" ],
+    "truncated": true,
+    "omitted_branches": 5
+  },
+  "terminal_conflicts": [ "…仅包含已保留节点对应的终端冲突…" ],
+  "truncated": true,
+  "node_budget": 4,
+  "retained_nodes": 4,
+  "omitted_nodes": 5,
+  "omitted_branches": 5
+}
+```
+
+调用示例（以 4 个节点的预算启动服务，再发起与上面相同的无解请求）：
+
+```bash
+RESOLVER_CONFLICT_NODE_BUDGET=4 uvicorn app.main:app --port 8000
+
+curl -s -X POST localhost:8000/resolve \
+  -H 'Content-Type: application/json' \
+  -d '{"packages": {"service-a": {"1.0": {"dependencies": {"libfoo": ">=2.0"}}},
+       "service-b": {"1.0": {"dependencies": {"libfoo": "<2.0"}}},
+       "libfoo": {"1.0": {}, "2.0": {}, "3.0": {}}},
+      "root": ["service-a", "service-b"]}'
+```
+
+该小例子的失败树本身只有少量节点，预算充足时输出不变；节点预算只在失败树
+（例如多个候选各引出深分支）超过预算时才体现为截断。`max_attempts` 触顶的
+`409 limit` 响应同样适用该预算。
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -1300,7 +1360,7 @@ pytest -q
 ```
 app/
   resolver.py       # PEP 440/508 解析、候选排序、回溯求解器、冲突数据结构、取消点
-  serialize.py      # 冲突树 / 终态冲突的 JSON 序列化
+  serialize.py      # 冲突树 / 终态冲突的 JSON 序列化；RESOLVER_CONFLICT_NODE_BUDGET 节点预算下的前序遍历与截断标记
   diagnose.py       # 根需求冲突诊断：逐条暂删+复算的最小冲突根集合（搜索触顶返回未确定）
   environment_matrix.py # 环境矩阵：多标记环境独立求解、成功环境版本矩阵与差异汇总
   version_withdrawal.py # 版本撤回分析：基线求解、移除单版本后整体重算、新增/消失/变更对比

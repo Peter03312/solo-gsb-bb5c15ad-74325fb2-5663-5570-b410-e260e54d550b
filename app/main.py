@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Optional
@@ -33,7 +34,11 @@ from .resolver import (
     parse_root_entries,
     resolve,
 )
-from .serialize import conflict_summary
+from .serialize import (
+    CONFLICT_NODE_BUDGET_ENV,
+    conflict_summary,
+    get_configured_node_budget,
+)
 from .upgrade_feasibility import run_upgrade_feasibility
 from .version_withdrawal import run_version_withdrawal
 
@@ -267,6 +272,14 @@ async def lifespan(_app: FastAPI):
     before the worker starts, so a crash/kill never strands work.
     """
     db_path = os.environ.get("RESOLVER_DB", DEFAULT_DB_PATH)
+    # Load (and therefore validate once, with a fallback warning) the
+    # server-wide conflict-tree node budget.
+    conflict_budget = get_configured_node_budget()
+    logging.getLogger(__name__).info(
+        "conflict tree node budget (%s): %s",
+        CONFLICT_NODE_BUDGET_ENV,
+        "unlimited" if conflict_budget is None else conflict_budget,
+    )
     store = JobStore(db_path)
     store.requeue_stale_running()
     worker = JobWorker(store, run_resolution_job)
