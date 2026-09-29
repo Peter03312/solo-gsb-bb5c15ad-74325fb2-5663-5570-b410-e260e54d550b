@@ -13,6 +13,12 @@ services:
       # below, so queued and finished jobs survive `docker compose up
       # --build` and container restarts.
       RESOLVER_DB: /app/data/jobs.db
+      # Optional cap on conflict-tree nodes serialized into a 409 response.
+      # Unset/empty keeps the full failure tree; a positive integer truncates
+      # the traversal (and lists only retained terminals) once the budget is
+      # spent. Invalid values fail startup. Solver choices/attempts/locks are
+      # unaffected -- only the conflict summary serialization is bounded.
+      # RESOLVER_CONFLICT_NODE_BUDGET: "500"
     volumes:
       - resolver-data:/app/data
     # The service only needs the loopback/network you expose; it never calls

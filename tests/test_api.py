@@ -1,5 +1,6 @@
 """End-to-end API tests for the resolver service."""
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -298,3 +299,65 @@ def test_empty_root_resolves_nothing():
     status, body = _resolve(packages={"x": {"1.0": {}}}, root={})
     assert status == 200
     assert body["resolved"] == {}
+
+
+def test_conflict_tree_unchanged_without_node_budget(monkeypatch):
+    monkeypatch.delenv("RESOLVER_CONFLICT_NODE_BUDGET", raising=False)
+    packages = {
+        "root": {
+            "3.0": {"dependencies": {"a": ">=2.0"}},
+            "2.0": {"dependencies": {"b": ">=2.0"}},
+            "1.0": {"dependencies": {"c": ">=2.0"}},
+        },
+        "a": {"1.0": {}},
+        "b": {"1.0": {}},
+        "c": {"1.0": {}},
+    }
+    status, body = _resolve(packages=packages, root={"root": ""})
+    assert status == 409
+    conflict = body["conflict"]
+    assert "truncated" not in conflict
+    assert len(conflict["tree"]["failed_branches"]) == 3
+    assert {t["package"] for t in conflict["terminal_conflicts"]} == {"a", "b", "c"}
+
+
+def test_conflict_tree_truncated_by_server_node_budget(monkeypatch):
+    monkeypatch.setenv("RESOLVER_CONFLICT_NODE_BUDGET", "3")
+    packages = {
+        "root": {
+            "3.0": {"dependencies": {"a": ">=2.0"}},
+            "2.0": {"dependencies": {"b": ">=2.0"}},
+            "1.0": {"dependencies": {"c": ">=2.0"}},
+        },
+        "a": {"1.0": {}},
+        "b": {"1.0": {}},
+        "c": {"1.0": {}},
+    }
+    status, body = _resolve(packages=packages, root={"root": ""})
+    assert status == 409
+    assert body["status"] == "conflict"
+    conflict = body["conflict"]
+    # Truncation is signalled inside the original 409 conflict payload.
+    assert conflict["truncated"] is True
+    assert conflict["truncation_reason"] == "node_budget_exhausted"
+    assert conflict["node_budget"] == 3
+    assert conflict["retained_nodes"] == 3
+    tree = conflict["tree"]
+    assert tree["truncated"] is True
+    assert tree["omitted_branches"] == 1
+    assert [n["package"] for n in tree["failed_branches"]] == ["a", "b"]
+    # Only terminals belonging to retained nodes survive; constraint paths
+    # on the retained terminals stay intact.
+    assert [t["package"] for t in conflict["terminal_conflicts"]] == ["a", "b"]
+    for terminal in conflict["terminal_conflicts"]:
+        for entry in terminal["active_constraints"]:
+            assert entry["path"][0]["name"] == "<root>"
+
+
+def test_invalid_server_node_budget_fails_at_startup(monkeypatch):
+    monkeypatch.setenv("RESOLVER_CONFLICT_NODE_BUDGET", "zero")
+    # The lifespan rejects the invalid configuration explicitly instead of
+    # silently serving unlimited conflict reports.
+    with pytest.raises(RuntimeError, match="node budget"):
+        with TestClient(app):
+            pass

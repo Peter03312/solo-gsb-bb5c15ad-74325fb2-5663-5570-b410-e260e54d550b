@@ -33,7 +33,7 @@ from .resolver import (
     parse_root_entries,
     resolve,
 )
-from .serialize import conflict_summary
+from .serialize import CONFLICT_NODE_BUDGET_ENV, conflict_summary, parse_node_budget
 from .upgrade_feasibility import run_upgrade_feasibility
 from .version_withdrawal import run_version_withdrawal
 
@@ -267,6 +267,12 @@ async def lifespan(_app: FastAPI):
     before the worker starts, so a crash/kill never strands work.
     """
     db_path = os.environ.get("RESOLVER_DB", DEFAULT_DB_PATH)
+    # Fail fast on an invalid conflict-tree node budget instead of silently
+    # emitting unlimited (or broken) conflict reports later.
+    try:
+        parse_node_budget(os.environ.get(CONFLICT_NODE_BUDGET_ENV))
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     store = JobStore(db_path)
     store.requeue_stale_running()
     worker = JobWorker(store, run_resolution_job)
@@ -282,7 +288,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Local PEP 440 Dependency Resolver",
-    version="1.10.0",
+    version="1.11.0",
     description=(
         "Resolves transitive dependencies from a self-contained package index. "
         "No external package index or account is used."

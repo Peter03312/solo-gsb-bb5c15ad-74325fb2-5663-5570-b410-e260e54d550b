@@ -28,6 +28,11 @@
   - 互相矛盾的约束（说明符、提出者及其版本）；
   - 每条约束完整的**依赖路径**（从根一路到提出约束的包）；
   - 候选版本清单与已尝试版本，以及整棵失败分支树，而不是一句笼统错误。
+  - 失败分支极多时，服务端可用环境变量 `RESOLVER_CONFLICT_NODE_BUDGET`
+    给冲突树序列化设置**节点预算**：预算足够时字段、分支顺序与约束路径
+    完全不变；预算耗尽时在同一个 409 响应中标记 `truncated`，只保留
+    已保留节点对应的 `terminal_conflicts`，不再展开其余分支（求解选择、
+    尝试次数与锁处置不受影响）。
 - **PEP 508**：依赖可写成 `name[extra] spec; marker` 字符串；环境标记在固定的
   默认环境下求值（可用 `marker_env` 覆盖），保证结果可复现。
 - **同步 + 异步两种用法**：`POST /resolve` 立即返回；`POST /jobs` 把同样的请求
@@ -1087,6 +1092,16 @@ curl -s -X POST localhost:8000/resolve/avoid-vulnerabilities \
 
 如需清空历史，可删除卷：`docker compose down -v`。
 
+### 服务端配置（环境变量）
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `RESOLVER_DB` | `./data/jobs.db` | 异步作业的 SQLite 数据库路径。 |
+| `RESOLVER_CONFLICT_NODE_BUDGET` | 未设置（不限） | 冲突报告失败树的最大序列化节点数。正整数；留空表示完整展开。非法或非正整数在启动时直接报错。只影响 409 冲突摘要的遍历，不影响求解选择、`attempts` 与 `locks`。 |
+
+`docker-compose.yml` 中留有对应示例，取消注释即可对容器生效；本地直接运行
+`uvicorn` 时同样可用该环境变量。
+
 ## 请求格式
 
 `/resolve`、`POST /jobs` 与 `/diagnose/root-conflict` 使用**完全相同**的请求体
@@ -1122,6 +1137,10 @@ curl -s -X POST localhost:8000/resolve/avoid-vulnerabilities \
 - `allow_prereleases`：可选，默认 `false`。
 - `marker_env`：可选，覆盖标记求值环境。
 - `max_attempts`：可选，候选求值上限（默认 100000）。
+
+冲突报告的节点预算**不是请求字段**，而是服务端配置
+（`RESOLVER_CONFLICT_NODE_BUDGET`，见上文“服务端配置”），对所有调用方
+统一生效。
 
 ### 成功响应（200）
 
@@ -1265,6 +1284,86 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
 }
 ```
 
+#### 节点预算与截断
+
+大规模回溯的失败树可能非常庞大。服务端可通过环境变量
+`RESOLVER_CONFLICT_NODE_BUDGET` 设置冲突树的**节点预算**（正整数；未设置
+或留空表示不限预算，即历史行为；非法值在启动时直接报错）：
+
+```bash
+RESOLVER_CONFLICT_NODE_BUDGET=3 uvicorn app.main:app --port 8000
+# docker compose：
+#   environment:
+#     RESOLVER_CONFLICT_NODE_BUDGET: "500"
+```
+
+预算只作用于**冲突摘要的序列化遍历**：求解器的候选选择、`attempts`
+与 `locks` 处置完全不变，HTTP 状态码仍是 **409**。
+
+- **预算充足**：`conflict.tree`、`conflict.terminal_conflicts` 的字段、
+  分支顺序与每条约束路径与不限预算时逐字节一致，不出现任何截断标记。
+- **预算耗尽**：按深度优先的确定性分支顺序保留前 N 个节点后停止：
+  - `conflict.truncated` 为 `true`，并带 `truncation_reason:
+    "node_budget_exhausted"`、`node_budget` 与 `retained_nodes`；
+  - 被截断的复合节点带 `"truncated": true` 与
+    `omitted_branches`（未展开的直接分支数）；
+  - `terminal_conflicts` **只列出已保留节点下的终端冲突**，其余分支不再
+    展开；已保留终端上的约束路径保持完整。
+
+上例的失败树只有 3 个节点（`service-a` → `service-b` → `libfoo`）。
+用一个三分支扇出的例子说明截断：`root` 的每个候选版本都要求一个
+仅有 `1.0` 的包满足 `>=2.0`，因此根节点下有三个叶子终端。预算设为 `3`
+（根节点 + 前两个叶子）：
+
+```bash
+RESOLVER_CONFLICT_NODE_BUDGET=3 curl -s -X POST localhost:8000/resolve \
+  -H 'Content-Type: application/json' -d '{
+  "packages": {
+    "root": {"3.0": {"dependencies": {"a": ">=2.0"}},
+             "2.0": {"dependencies": {"b": ">=2.0"}},
+             "1.0": {"dependencies": {"c": ">=2.0"}}},
+    "a": {"1.0": {}},
+    "b": {"1.0": {}},
+    "c": {"1.0": {}}
+  },
+  "root": {"root": ""}
+}'
+```
+
+```json
+{
+  "status": "conflict",
+  "attempts": 3,
+  "locks": {},
+  "conflict": {
+    "truncated": true,
+    "truncation_reason": "node_budget_exhausted",
+    "node_budget": 3,
+    "retained_nodes": 3,
+    "tree": {
+      "kind": "composite",
+      "package": "root",
+      "attempted_versions": ["3.0", "2.0", "1.0"],
+      "failed_branches": [
+        {"kind": "leaf", "package": "a", "reason": "unsatisfiable", "...": "..."},
+        {"kind": "leaf", "package": "b", "reason": "unsatisfiable", "...": "..."}
+      ],
+      "truncated": true,
+      "omitted_branches": 1
+    },
+    "terminal_conflicts": [
+      {"package": "a", "...": "仅包含已保留节点 a、b 对应的终端冲突"},
+      {"package": "b", "...": ""}
+    ]
+  }
+}
+```
+
+其他返回结构化 `conflict` 的接口（`/resolve/avoid-vulnerabilities`、
+`/analyze/version-withdrawal`、`/analyze/upgrade-feasibility`、
+`/analyze/environment-matrix` 的各环境结果及异步 `/jobs` 的 409 响应）
+共用同一序列化逻辑与该服务端预算。
+
 错误请求（非 PEP 440 版本、非法说明符、多余字段等）返回 `400/422` 并附带原因。
 
 ## 本地开发（不使用 Docker）
@@ -1300,7 +1399,7 @@ pytest -q
 ```
 app/
   resolver.py       # PEP 440/508 解析、候选排序、回溯求解器、冲突数据结构、取消点
-  serialize.py      # 冲突树 / 终态冲突的 JSON 序列化
+  serialize.py      # 冲突树 / 终态冲突的 JSON 序列化；RESOLVER_CONFLICT_NODE_BUDGET 节点预算的受约束遍历与截断标记
   diagnose.py       # 根需求冲突诊断：逐条暂删+复算的最小冲突根集合（搜索触顶返回未确定）
   environment_matrix.py # 环境矩阵：多标记环境独立求解、成功环境版本矩阵与差异汇总
   version_withdrawal.py # 版本撤回分析：基线求解、移除单版本后整体重算、新增/消失/变更对比
